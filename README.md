@@ -56,6 +56,26 @@ pip install -r requirements.txt
 ```bash
 pip install flash-attn --no-build-isolation
 ```
+
+#### Windows + NVIDIA Blackwell (`sm_120`)
+
+The Windows/Blackwell setup used by this fork was tested with Python 3.11,
+PyTorch 2.7.1 + CUDA 12.8, and an NVIDIA RTX PRO 6000 Blackwell Workstation
+Edition. It uses the following third-party community build of FlashAttention 2:
+
+- Source repository: [marcorez8/flash-attn-windows-blackwell](https://huggingface.co/marcorez8/flash-attn-windows-blackwell)
+- Wheel: [`flash_attn-2.7.4.post1-cp311-cp311-win_amd64.whl`](https://huggingface.co/marcorez8/flash-attn-windows-blackwell/resolve/main/flash_attn-2.7.4.post1-cp311-cp311-win_amd64-torch2.7.0-cu128/flash_attn-2.7.4.post1-cp311-cp311-win_amd64.whl?download=true)
+- SHA-256: `f076c6cad625fce396f61bf25e88aa634a7b6f3e02a1fb5b6a81e782679e0ec0`
+
+Download the wheel, verify its checksum, and install it into the project virtual
+environment. The binary is not produced or endorsed by the upstream
+FlashAttention project, so review its provenance before use.
+
+```powershell
+Get-FileHash -Algorithm SHA256 .\flash_attn-2.7.4.post1-cp311-cp311-win_amd64.whl
+.\.venv\Scripts\python.exe -m pip install --no-deps .\flash_attn-2.7.4.post1-cp311-cp311-win_amd64.whl
+```
+
 5. Install this repository as a local editable package:
 ```bash
 pip install -e .

@@ -1,5 +1,6 @@
 import torch
 import math
+import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention as flex_attention_func
 
 
@@ -22,7 +23,10 @@ print(f"[PreInfo] Use flash attention={FLASH_VER}")
 flex_attention_func = torch.compile(
     flex_attention_func,
     dynamic=False,             
-    mode="max-autotune",
+    # max-autotune tries Hopper-sized Triton configurations on Blackwell
+    # workstation GPUs.  Some of those exceed the SM 12.0 shared-memory
+    # limit and can spend minutes benchmarking unusable kernels.
+    mode="default",
     fullgraph=True,     
     backend="inductor"
 )
@@ -95,7 +99,35 @@ def flash_attention(
     if q_scale is not None:
         q = q * q_scale
     # apply attention
-    if FLASH_VER == 3:
+    if FLASH_VER is None:
+        # Native PyTorch fallback for platforms where flash-attn has no
+        # compatible wheel (notably Windows and Blackwell GPUs).  SDPA still
+        # dispatches to an optimized CUDA kernel when the inputs permit it.
+        outputs = []
+        for batch_idx in range(b):
+            q_len = int(q_lens[batch_idx])
+            k_len = int(k_lens[batch_idx])
+            q_item = q[sum(int(v) for v in q_lens[:batch_idx]):sum(int(v) for v in q_lens[:batch_idx + 1])]
+            k_item = k[sum(int(v) for v in k_lens[:batch_idx]):sum(int(v) for v in k_lens[:batch_idx + 1])]
+            v_item = v[sum(int(v) for v in k_lens[:batch_idx]):sum(int(v) for v in k_lens[:batch_idx + 1])]
+
+            q_item = q_item.transpose(0, 1).unsqueeze(0)
+            k_item = k_item.transpose(0, 1).unsqueeze(0)
+            v_item = v_item.transpose(0, 1).unsqueeze(0)
+            item = F.scaled_dot_product_attention(
+                q_item,
+                k_item,
+                v_item,
+                dropout_p=dropout_p,
+                is_causal=causal,
+                scale=softmax_scale,
+                enable_gqa=q_item.size(1) != k_item.size(1),
+            ).squeeze(0).transpose(0, 1)
+            if q_len < lq:
+                item = F.pad(item, (0, 0, 0, 0, 0, lq - q_len))
+            outputs.append(item)
+        x = torch.stack(outputs)
+    elif FLASH_VER == 3:
         # Note: dropout_p, window_size are not supported in FA3 now.
         x = flash_attn_varlen_func(
             q=q,
@@ -184,6 +216,17 @@ def flex_attention(
 
     q = q.to(v.dtype)
     k = k.to(v.dtype)
+
+    if kernel_options is None:
+        # Conservative inference configuration for Windows / SM 12.0.  The
+        # 64x64, one-stage kernel stays below the per-block shared-memory
+        # ceiling while preserving the custom sparse mask and score modifier.
+        kernel_options = {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
 
 
     x = flex_attention_func(

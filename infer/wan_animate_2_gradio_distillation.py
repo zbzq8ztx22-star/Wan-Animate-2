@@ -46,8 +46,12 @@ class WanAnimate2App:
     def setup_distributed(self):
         self.pipeline = build_object_from_config_file(self.config)
 
+    def stop_generation(self):
+        self.pipeline.cancel()
+        return "Stopping after the current GPU operation..."
+
     def process_video(self, refer_img, tpl_video_path, width, height, fps=30, seed=-1,
-                      clip_len=65, sample_guide_scale=1.0, step=20,
+                      clip_len=33, sample_guide_scale=1.0, step=20,
                       prompt=None, prompt_ref=None):
         # 创建新的会话目录
         session_dir = self.storage_manager.create_session_dir()
@@ -94,6 +98,8 @@ class WanAnimate2App:
                 yaml.dump(params, f)
 
             toc = time.time()
+            if result is None:
+                return None, "Stopped. The model remains loaded and is ready for another run."
             print(f"Processing time: {format_time(toc - tic)}")
             return result, f"Processing time: {format_time(toc - tic)}"
 
@@ -116,8 +122,8 @@ def create_ui(config_path, output_dir="outputs"):
                 tpl_video = gr.Video(label="Template Video")
 
                 with gr.Row():
-                    width = gr.Number(label="Width", value=720)
-                    height = gr.Number(label="Height", value=1280)
+                    width = gr.Number(label="Width", value=480)
+                    height = gr.Number(label="Height", value=832)
 
                 with gr.Row():
                     fps = gr.Number(label="FPS", value=24)
@@ -125,7 +131,7 @@ def create_ui(config_path, output_dir="outputs"):
                     step = gr.Number(label="step", value=10)
 
                 with gr.Row():
-                    clip_len = gr.Number(label="CLIP_LEN", value=81)
+                    clip_len = gr.Number(label="CLIP_LEN", value=33)
                     sample_guide_scale = gr.Number(label="CFG", value=1.0)
 
                 prompt = gr.Textbox(
@@ -146,7 +152,9 @@ def create_ui(config_path, output_dir="outputs"):
                     info="描述输入视频内容..."
                 )
 
-                generate_btn = gr.Button("Generate")
+                with gr.Row():
+                    generate_btn = gr.Button("Generate", variant="primary")
+                    stop_btn = gr.Button("Stop", variant="stop")
 
             with gr.Column():
                 output_video = gr.Video(label="Generated Video")
@@ -158,6 +166,11 @@ def create_ui(config_path, output_dir="outputs"):
             inputs=[refer_img, tpl_video, width, height, fps, seed, clip_len, sample_guide_scale, 
                     step, prompt, prompt_ref],
             outputs=[output_video, output_status]
+        )
+        stop_btn.click(
+            fn=app.stop_generation,
+            outputs=output_status,
+            queue=False,
         )
 
     return demo
@@ -171,4 +184,8 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default="outputs", help="输出目录路径")
     args = parser.parse_args()
     demo = create_ui(args.config, args.output_dir)
-    demo.launch(server_name='0.0.0.0', server_port=args.port)
+    demo.launch(
+        server_name='0.0.0.0',
+        server_port=args.port,
+        allowed_paths=[os.path.abspath(args.output_dir)],
+    )
