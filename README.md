@@ -41,11 +41,13 @@ Release Notes:
 1. Clone this repo:
 ```bash
 git clone --recursive https://github.com/Wan-Video/Wan-Animate-2.git
+cd Wan-Animate-2
 ```
 <!-- TODO -->
 2. Create python environment and install torch:
 ```bash
 conda create -n wan_animate_2 python==3.11 -y
+conda activate wan_animate_2
 pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu126
 ```
 3. Install dependencies (please refer to [requirements.txt](requirements.txt)):
@@ -56,6 +58,26 @@ pip install -r requirements.txt
 ```bash
 pip install flash-attn --no-build-isolation
 ```
+
+#### Windows + NVIDIA Blackwell (`sm_120`)
+
+The Windows/Blackwell setup used by this fork was tested with Python 3.11,
+PyTorch 2.7.1 + CUDA 12.8, and an NVIDIA RTX PRO 6000 Blackwell Workstation
+Edition. It uses the following third-party community build of FlashAttention 2:
+
+- Source repository: [marcorez8/flash-attn-windows-blackwell](https://huggingface.co/marcorez8/flash-attn-windows-blackwell)
+- Wheel: [`flash_attn-2.7.4.post1-cp311-cp311-win_amd64.whl`](https://huggingface.co/marcorez8/flash-attn-windows-blackwell/resolve/main/flash_attn-2.7.4.post1-cp311-cp311-win_amd64-torch2.7.0-cu128/flash_attn-2.7.4.post1-cp311-cp311-win_amd64.whl?download=true)
+- SHA-256: `f076c6cad625fce396f61bf25e88aa634a7b6f3e02a1fb5b6a81e782679e0ec0`
+
+Download the wheel, verify its checksum, and install it into the project virtual
+environment. The binary is not produced or endorsed by the upstream
+FlashAttention project, so review its provenance before use.
+
+```powershell
+Get-FileHash -Algorithm SHA256 .\flash_attn-2.7.4.post1-cp311-cp311-win_amd64.whl
+.\.venv\Scripts\python.exe -m pip install --no-deps .\flash_attn-2.7.4.post1-cp311-cp311-win_amd64.whl
+```
+
 5. Install this repository as a local editable package:
 ```bash
 pip install -e .

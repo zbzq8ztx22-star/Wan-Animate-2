@@ -1,4 +1,5 @@
 import os
+import tempfile
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import math
@@ -148,7 +149,7 @@ class ForwardStepWrapper(nn.Module):
         return self.wrapped_module(*args, **kwargs)
 
 
-def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, context_null, device):
+def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, context_null, device, cancel_event=None):
     height = item.height
     width = item.width
     CLIP_LEN = item.clip_len
@@ -182,6 +183,16 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
     start = 0
     end = CLIP_LEN
     all_out_frames = []
+
+    def cancelled(stage):
+        if cancel_event is not None and cancel_event.is_set():
+            logger.info(f"[GPU {gpu}] Inference cancelled during {stage}")
+            torch.cuda.empty_cache()
+            return True
+        return False
+
+    if cancelled("startup"):
+        return {'result': None, 'status': 'cancelled'} if gpu == 0 else None
 
     logger.info(f"Processing reference image: {refer_img_path}")
     first_img = cv2.imread(refer_img_path)[..., ::-1]
@@ -228,6 +239,9 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
     torch.cuda.empty_cache()
     idex = 0
     while True:
+        if cancelled("clip preparation"):
+            return {'result': None, 'status': 'cancelled'} if gpu == 0 else None
+
         if start + first_num >= len(cond_images):
             break
         
@@ -266,7 +280,10 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
                                           "t c h w -> 1 c t h w",
                                           )
         idex += 1
-        dist.barrier(device_ids=[gpu])
+        if dist.get_backend() == "nccl":
+            dist.barrier(device_ids=[gpu])
+        else:
+            dist.barrier()
         for key, value in batch.items():
             if isinstance(value, torch.Tensor):
                 batch[key] = value.to(device=device, dtype=torch.bfloat16)
@@ -431,6 +448,9 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
             timestep = torch.stack(timestep)
             model(condition_latents, grid_sizes=grid_sizes, k_cache=k_cache, v_cache=v_cache, t=timestep,  method='forward_ref', **arg_ref_c)
             for i, t in enumerate(tqdm(timesteps)):
+                if cancelled(f"diffusion step {i + 1}/{len(timesteps)}"):
+                    return {'result': None, 'status': 'cancelled'} if gpu == 0 else None
+
                 latent_model_input = latents
                 timestep = [t]
 
@@ -508,8 +528,9 @@ def inference_core(item, gpu, cfg, clip, vae, model, t5, use_t5, context, contex
     return None
         
 
-def worker(gpu, cfg, in_q_list, out_q, initialized_events):
+def worker(gpu, cfg, in_q_list, out_q, initialized_events, cancel_events):
     event = initialized_events[gpu]
+    cancel_event = cancel_events[gpu]
     in_q = in_q_list[gpu]
     out_q = out_q
 
@@ -526,13 +547,24 @@ def worker(gpu, cfg, in_q_list, out_q, initialized_events):
     try:
         torch.cuda.set_device(gpu)
         logger.info(f"[GPU {gpu}] Initializing process group with rank {cfg.rank}, world_size {cfg.world_size}")
-        dist.init_process_group(
-            backend="nccl",
-            init_method="env://",
-            rank=cfg.rank,
-            world_size=cfg.world_size,
-            timeout=timedelta(seconds=int(os.getenv("NCCL_INIT_TIMEOUT_SEC", "3600"))),
-        )
+        distributed_backend = "nccl" if dist.is_nccl_available() else "gloo"
+        logger.info(f"[GPU {gpu}] Distributed backend: {distributed_backend}")
+        if distributed_backend == "gloo" and cfg.world_size == 1:
+            store_path = os.path.join(tempfile.gettempdir(), f"wan_animate_2_dist_{os.getpid()}")
+            dist.init_process_group(
+                backend=distributed_backend,
+                store=dist.FileStore(store_path, 1),
+                rank=cfg.rank,
+                world_size=cfg.world_size,
+            )
+        else:
+            dist.init_process_group(
+                backend=distributed_backend,
+                init_method="env://",
+                rank=cfg.rank,
+                world_size=cfg.world_size,
+                timeout=timedelta(seconds=int(os.getenv("NCCL_INIT_TIMEOUT_SEC", "3600"))),
+            )
 
         if cfg.test_cfg.sp_size > cfg.test_cfg.world_size:
             logger.warning(f"[GPU {gpu}] Reset sp_size to world_size ({cfg.test_cfg.world_size})")
@@ -625,40 +657,47 @@ def worker(gpu, cfg, in_q_list, out_q, initialized_events):
             raise
 
         # [model] transformer
+        previous_default_dtype = torch.get_default_dtype()
         try:
             with torch.device('meta'):
-                model = build_object_from_dict(cfg.model.transformer)
                 torch.set_default_dtype(torch.bfloat16)
+                model = build_object_from_dict(cfg.model.transformer)
         except Exception as e:
             logger.error(f"[GPU {gpu}] Failed to initialize transformer: {str(e)}")
             logger.error(f"[GPU {gpu}] Error traceback: {traceback.format_exc()}")
             raise
+        finally:
+            torch.set_default_dtype(previous_default_dtype)
         
-        cfg.test_cfg.sharding_size = min(cfg.test_cfg.sharding_size, cfg.test_cfg.world_size)
-        # prepare fsdp args
-        fsdp_mesh = init_device_mesh(
-                device_type='cuda', 
-                mesh_shape=(dist.get_world_size() // cfg.test_cfg.sharding_size, cfg.test_cfg.sharding_size),
-                mesh_dim_names=('replicate', 'shard')
-            )
-        
-        fsdp_kwargs = dict(
-                mesh=fsdp_mesh,
-                reshard_after_forward=True,
-                shard_placement_fn=None,
-                mp_policy=MixedPrecisionPolicy(
-                    param_dtype=torch.bfloat16,
-                    reduce_dtype=torch.bfloat16,
-                    output_dtype=torch.bfloat16,
-                    cast_forward_inputs=False
-                ),
-                offload_policy=None,
-                ignored_params=None
-            )
-        
-        for block in model.blocks:
-                fully_shard(block, **fsdp_kwargs)
-        fully_shard(model, **fsdp_kwargs)
+        use_fsdp2 = dist.get_backend() == "nccl"
+        if use_fsdp2:
+            cfg.test_cfg.sharding_size = min(cfg.test_cfg.sharding_size, cfg.test_cfg.world_size)
+            # prepare fsdp args
+            fsdp_mesh = init_device_mesh(
+                    device_type='cuda',
+                    mesh_shape=(dist.get_world_size() // cfg.test_cfg.sharding_size, cfg.test_cfg.sharding_size),
+                    mesh_dim_names=('replicate', 'shard')
+                )
+
+            fsdp_kwargs = dict(
+                    mesh=fsdp_mesh,
+                    reshard_after_forward=True,
+                    shard_placement_fn=None,
+                    mp_policy=MixedPrecisionPolicy(
+                        param_dtype=torch.bfloat16,
+                        reduce_dtype=torch.bfloat16,
+                        output_dtype=torch.bfloat16,
+                        cast_forward_inputs=False
+                    ),
+                    offload_policy=None,
+                    ignored_params=None
+                )
+
+            for block in model.blocks:
+                    fully_shard(block, **fsdp_kwargs)
+            fully_shard(model, **fsdp_kwargs)
+        elif cfg.world_size != 1:
+            raise RuntimeError("The Gloo fallback only supports single-GPU inference.")
         
         model = model.to_empty(device=device)
         model = model.eval().requires_grad_(False)
@@ -672,17 +711,23 @@ def worker(gpu, cfg, in_q_list, out_q, initialized_events):
         else:
             sd = {}
 
-        dist.barrier(device_ids=[gpu])
-        set_model_state_dict(
-            model=model,
-            model_state_dict=sd,
-            options=StateDictOptions(
-                full_state_dict=True,
-                cpu_offload=True,
-                broadcast_from_rank0=True,
-                strict=True
+        if dist.get_backend() == "nccl":
+            dist.barrier(device_ids=[gpu])
+        else:
+            dist.barrier()
+        if use_fsdp2:
+            set_model_state_dict(
+                model=model,
+                model_state_dict=sd,
+                options=StateDictOptions(
+                    full_state_dict=True,
+                    cpu_offload=True,
+                    broadcast_from_rank0=True,
+                    strict=True
+                )
             )
-        )
+        else:
+            model.load_state_dict(sd, strict=True)
         del sd
 
         torch.cuda.empty_cache()
@@ -699,10 +744,15 @@ def worker(gpu, cfg, in_q_list, out_q, initialized_events):
                 item = in_q.get()
                 if item.get("overwrite_cfg", None):
                     cfg = merge_configs(cfg, item["overwrite_cfg"])
-                res = inference_core(item, gpu, cfg, clip, vae, model, t5, cfg.model.use_t5, context, context_null, device)
+                res = inference_core(
+                    item, gpu, cfg, clip, vae, model, t5,
+                    cfg.model.use_t5, context, context_null, device,
+                    cancel_event=cancel_event,
+                )
                 
                 if res is not None:
                     out_q.put(res)
+                torch.cuda.empty_cache()
                 
             except Exception as e:
                 logger.error(f"[GPU {gpu}] Error during inference: {str(e)}")
@@ -754,20 +804,25 @@ def main(cfg):
     cfg.world_size = cfg.pmi_world_size * cfg.test_cfg.gpu_infer_per_machine
     cfg.test_cfg.world_size = cfg.world_size
     
+    manager = torch.multiprocessing.Manager()
     in_q_list = [
-        torch.multiprocessing.Manager().Queue()
+        manager.Queue()
         for _ in range(cfg.test_cfg.gpu_infer_per_machine)
     ]
-    out_q = torch.multiprocessing.Manager().Queue()
+    out_q = manager.Queue()
     initialized_events = [
-        torch.multiprocessing.Manager().Event()
+        manager.Event()
+        for _ in range(cfg.test_cfg.gpu_infer_per_machine)
+    ]
+    cancel_events = [
+        manager.Event()
         for _ in range(cfg.test_cfg.gpu_infer_per_machine)
     ]
 
     context = mp.spawn(
         worker,
         nprocs=cfg.test_cfg.gpu_infer_per_machine,
-        args=(cfg, in_q_list, out_q, initialized_events),
+        args=(cfg, in_q_list, out_q, initialized_events, cancel_events),
         join=False,
     )
 
@@ -779,7 +834,7 @@ def main(cfg):
     logger.info("Inference model is initialized", flush=True)
     inference_pids = context.pids()
 
-    return in_q_list, out_q, inference_pids
+    return in_q_list, out_q, inference_pids, cancel_events, manager
 
 
 class WanAnimate2MPIPipeline(BaseInferencePipeline):
@@ -794,11 +849,22 @@ class WanAnimate2MPIPipeline(BaseInferencePipeline):
             os.environ["RANK"] = os.getenv("rank_id", "0")
             os.environ["WORLD_SIZE"] = os.getenv("WORLD_SIZE", "1")
 
-        self.in_q_list, self.out_q, self.inference_pids = main(self.hparams)    
+        (
+            self.in_q_list,
+            self.out_q,
+            self.inference_pids,
+            self.cancel_events,
+            self.manager,
+        ) = main(self.hparams)
+
+    def cancel(self):
+        """Request cooperative cancellation without terminating model workers."""
+        for event in self.cancel_events:
+            event.set()
     
     def __call__(
-        self, refer_img_path, tpl_video_path, output_path, width=720, height=1280, fps=24,
-        seed=-1, clip_len=81, sample_guide_scale=1.0, step=10,
+        self, refer_img_path, tpl_video_path, output_path, width=480, height=832, fps=24,
+        seed=-1, clip_len=33, sample_guide_scale=1.0, step=10,
         prompt=['视频中的人在做动作， 背景静止'],
         prompt_ref=['视频中的人在做动作， 背景静止'],
         neg_prompt=['过曝，静态，细节模糊不清，字幕，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，三条腿']
@@ -829,6 +895,9 @@ class WanAnimate2MPIPipeline(BaseInferencePipeline):
         )
 
         logger.info(f"Processing model inference")
+
+        for event in self.cancel_events:
+            event.clear()
         
         for in_q in self.in_q_list:
             in_q.put((item))

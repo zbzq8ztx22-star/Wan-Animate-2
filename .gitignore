@@ -1,5 +1,12 @@
 __pycache__/
 *.pyc
 *.pyo
+.venv/
+ckpts/
+outputs/
+downloads/
+logs/
+*.whl
+*.egg-info/
 __pycache__/
 *.pyc
