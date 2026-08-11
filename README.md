@@ -41,11 +41,13 @@ Release Notes:
 1. Clone this repo:
 ```bash
 git clone --recursive https://github.com/Wan-Video/Wan-Animate-2.git
+cd Wan-Animate-2
 ```
 <!-- TODO -->
 2. Create python environment and install torch:
 ```bash
 conda create -n wan_animate_2 python==3.11 -y
+conda activate wan_animate_2
 pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu126
 ```
 3. Install dependencies (please refer to [requirements.txt](requirements.txt)):
